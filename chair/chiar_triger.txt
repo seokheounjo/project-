@@ -1,0 +1,296 @@
+-- Materials_IncomingAndConsumptionRecords에 입고 내역이 등록될 때 실행되는 트리거
+
+DELIMITER //
+
+CREATE TRIGGER after_material_incoming
+AFTER INSERT ON Materials_IncomingAndConsumptionRecords
+FOR EACH ROW
+BEGIN
+    -- FinancialRecords에 입고 내역 반영
+
+    -- FinancialRecords 테이블에 입고 내역 추가
+    INSERT INTO FinancialRecords (recordDate, recordType, transactionCategory, description, amount, transactionStatus, materialRefID)
+    VALUES (NEW.incomingDate, '지출', '원자재 구매', CONCAT('원자재 구매 - ', NEW.materialRefID), NEW.cost, '완료', NEW.materialRefID);
+
+    -- RawMaterialsInventory에 입고 수량 반영
+
+    -- RawMaterialsInventory 테이블에서 해당 원자재의 입고 수량 업데이트
+    UPDATE RawMaterialsInventory
+    SET incomingAmount = incomingAmount + NEW.incomingQuantity
+    WHERE materialID = NEW.materialRefID;
+END;
+//
+
+DELIMITER ;
+
+
+-- Materials_IncomingAndConsumptionRecords에 소모 내역이 등록될 때 실행되는 트리거
+DELIMITER //
+
+CREATE TRIGGER after_material_consumption
+AFTER UPDATE ON Materials_IncomingAndConsumptionRecords
+FOR EACH ROW
+BEGIN
+    IF NEW.consumedQuantity > OLD.consumedQuantity THEN
+        -- FinancialRecords에 소모 내역 반영
+
+        -- FinancialRecords 테이블에 소모 내역 추가
+        INSERT INTO FinancialRecords (recordDate, recordType, transactionCategory, description, amount, transactionStatus, materialRefID)
+        VALUES (NEW.consumptionDate, '지출', '원자재 소모', CONCAT('원자재 소모 - ', NEW.materialRefID), (NEW.cost * (NEW.consumedQuantity - OLD.consumedQuantity)), '완료', NEW.materialRefID);
+    END IF;
+END;
+//
+
+DELIMITER ;
+
+
+-- 의자 생산 또는 재생 시 필요한 원자재 수량 감소 및 기록:
+DELIMITER //
+
+CREATE TRIGGER after_chair_production_or_regeneration
+AFTER INSERT ON ChairInventoryLog
+FOR EACH ROW
+BEGIN
+    DECLARE finished INT DEFAULT 0;
+    DECLARE materialID INT;
+    DECLARE neededQuantity INT;
+    DECLARE pricePerUnit DECIMAL(15, 2);
+    DECLARE cur CURSOR FOR
+        SELECT materialRefID, quantityRequired, pricePerUnit
+        FROM ChairMaterials
+        WHERE chairRefID = NEW.chairRefID;
+    DECLARE CONTINUE HANDLER FOR NOT FOUND SET finished = 1;
+
+    IF NEW.transactionType IN ('생산', '재생') THEN
+        OPEN cur;
+
+        material_loop: LOOP
+            FETCH cur INTO materialID, neededQuantity, pricePerUnit;
+            IF finished = 1 THEN
+                LEAVE material_loop;
+            END IF;
+
+            -- RawMaterialsInventory에서 필요한 원자재 수량 감소
+
+            -- RawMaterialsInventory 테이블에서 필요한 원자재의 소모량 업데이트
+            UPDATE RawMaterialsInventory
+            SET consumedAmount = consumedAmount + (neededQuantity * NEW.quantity)
+            WHERE materialID = materialID;
+
+            -- Materials_IncomingAndConsumptionRecords에 소모 내역 반영
+
+            -- Materials_IncomingAndConsumptionRecords 테이블에 소모 내역 추가
+            INSERT INTO Materials_IncomingAndConsumptionRecords (materialRefID, consumedQuantity, consumptionDate, cost)
+            VALUES (materialID, (neededQuantity * NEW.quantity), NOW(), (pricePerUnit * neededQuantity));
+
+            -- FinancialRecords에 금융 기록 추가
+
+            -- FinancialRecords 테이블에 금융 기록 추가
+            INSERT INTO FinancialRecords (recordDate, recordType, transactionCategory, description, amount, transactionStatus, materialRefID)
+            VALUES (NOW(), '지출', '원자재 소모', CONCAT('의자 제조 - ', NEW.chairRefID, ', 원자재 - ', materialID), (pricePerUnit * neededQuantity * NEW.quantity), '완료', materialID);
+        END LOOP;
+
+        CLOSE cur;
+    END IF;
+END;
+//
+
+DELIMITER ;
+
+
+-- 새 배송 기록이 추가될 때 실행되는 트리거:
+DELIMITER //
+
+CREATE TRIGGER before_delivery_insert
+BEFORE INSERT ON DeliveryRecords
+FOR EACH ROW
+BEGIN
+    IF NEW.receivedDate IS NULL THEN
+        -- 차량 상태를 '배달중'으로 설정
+
+        -- DeliveryVehicles 테이블에서 차량의 상태를 '배달중'으로 업데이트
+        UPDATE DeliveryVehicles
+        SET status = '배달중'
+        WHERE vehicleID = NEW.vehicleRefID;
+
+        -- 직원의 배달 여부를 '배달중'으로 설정
+
+        -- EmployeeManagement 테이블에서 직원의 배달 상태를 '배달중'으로 업데이트
+        UPDATE EmployeeManagement
+        SET delivery = '배달중'
+        WHERE employeeID IN (NEW.driver1RefID, NEW.driver2RefID);
+    END IF;
+END;
+//
+
+-- 기존 배송 기록이 업데이트될 때 실행되는 트리거
+CREATE TRIGGER before_delivery_update
+BEFORE UPDATE ON DeliveryRecords
+FOR EACH ROW
+BEGIN
+    IF NEW.receivedDate IS NULL THEN
+        -- 차량 상태를 '배달중'으로 유지
+
+        -- DeliveryVehicles 테이블에서 차량의 상태를 '배달중'으로 유지
+        UPDATE DeliveryVehicles
+        SET status = '배달중'
+        WHERE vehicleID = NEW.vehicleRefID;
+
+        -- 직원의 배달 여부를 '배달중'으로 유지
+
+        -- EmployeeManagement 테이블에서 직원의 배달 상태를 '배달중'으로 유지
+        UPDATE EmployeeManagement
+        SET delivery = '배달중'
+        WHERE employeeID IN (NEW.driver1RefID, NEW.driver2RefID);
+    END IF;
+END;
+//
+
+DELIMITER ;
+
+
+-- 배송 기록의 receivedDate가 업데이트될 때 실행되는 트리거:
+DELIMITER //
+
+CREATE TRIGGER after_delivery_received
+AFTER UPDATE ON DeliveryRecords
+FOR EACH ROW
+BEGIN
+    IF NEW.receivedDate IS NOT NULL THEN
+        -- 차량 상태를 '운행 가능'으로 업데이트
+
+        -- DeliveryVehicles 테이블에서 차량의 상태를 '운행 가능'으로 업데이트
+        UPDATE DeliveryVehicles
+        SET status = '운행 가능'
+        WHERE vehicleID = NEW.vehicleRefID;
+
+        -- 직원의 배달 여부를 '배달 가능'으로 업데이트
+
+        -- EmployeeManagement 테이블에서 직원의 배달 상태를 '배달 가능'으로 업데이트
+        UPDATE EmployeeManagement
+        SET delivery = '배달 가능'
+        WHERE employeeID IN (NEW.driver1RefID, NEW.driver2RefID);
+
+        -- ChairInventoryLog에 납품 기록 추가
+
+        -- ChairInventoryLog 테이블에 납품 기록 추가
+        INSERT INTO ChairInventoryLog (chairRefID, transactionType, transactionDate, quantity)
+        VALUES (NEW.productRefID, '납품', NOW(), NEW.quantity);
+
+        -- ProductInventory의 재고 수량 업데이트
+
+        -- ProductInventory 테이블에서 제품의 재고 수량 업데이트
+        UPDATE ProductInventory
+        SET stockAmount = stockAmount - NEW.quantity
+        WHERE productID = NEW.productRefID;
+
+        -- FinancialRecords에 금융 기록 추가
+
+        -- FinancialRecords 테이블에 금융 기록 추가
+        INSERT INTO FinancialRecords (recordDate, recordType, transactionCategory, description, amount, paymentMethod, transactionStatus, productRefID)
+        VALUES (NOW(), '수입', '제품 판매', CONCAT('제품 판매 - ', NEW.productRefID), NEW.saleAmount, '전자 송금', '완료', NEW.productRefID);
+    END IF;
+END;
+//
+
+DELIMITER ;
+
+
+-- 차량 장비 유지보수 트리거:
+DELIMITER //
+
+CREATE TRIGGER after_truck_maintenance
+AFTER INSERT ON Truck_MaintenanceRecords
+FOR EACH ROW
+BEGIN
+    -- FinancialRecords 테이블에 장비 유지보수 비용 기록 추가
+
+    INSERT INTO FinancialRecords (
+        recordDate, 
+        recordType, 
+        transactionCategory, 
+        description, 
+        amount, 
+        paymentMethod, 
+        transactionStatus, 
+        vehicleRefID
+    )
+    VALUES (
+        NEW.maintenanceDate, 
+        '지출', 
+        '장비 유지보수', 
+        CONCAT('장비 유지보수 - ', NEW.equipmentRefID), 
+        NEW.cost, 
+        '전자 송금', 
+        '완료', 
+        NEW.equipmentRefID
+    );
+END;
+//
+
+DELIMITER ;
+
+
+--의자 생산시 원자재 사용량을 원자재 일지에 반영하는 트리거:
+DELIMITER //
+
+CREATE TRIGGER add_material_consumption_record
+AFTER UPDATE ON ProductInventory
+FOR EACH ROW
+BEGIN
+    DECLARE done INT DEFAULT FALSE;
+    DECLARE materialRefID INT;
+    DECLARE quantityRequired INT;
+    DECLARE pricePerUnit DECIMAL(15, 2);
+    DECLARE cur CURSOR FOR
+        SELECT ChairMaterials.materialRefID, ChairMaterials.quantityRequired, RawMaterialsInventory.price
+        FROM ChairMaterials
+        JOIN RawMaterialsInventory ON ChairMaterials.materialRefID = RawMaterialsInventory.materialID
+        WHERE ChairMaterials.chairRefID = NEW.productID;
+    DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = TRUE;
+
+    -- 제품 재고가 증가했을 때만 실행
+    IF NEW.stockAmount > OLD.stockAmount THEN
+        OPEN cur;
+
+        material_loop: LOOP
+            FETCH cur INTO materialRefID, quantityRequired, pricePerUnit;
+            IF done THEN
+                LEAVE material_loop;
+            END IF;
+
+            -- 소모된 수량 계산
+            SET @consumedQuantity = quantityRequired * (NEW.stockAmount - OLD.stockAmount);
+
+            -- Materials_IncomingAndConsumptionRecords 테이블에 소모 기록 추가
+
+            INSERT INTO Materials_IncomingAndConsumptionRecords (materialRefID, consumedQuantity, cost, consumptionDate)
+            VALUES (materialRefID, @consumedQuantity, @consumedQuantity * pricePerUnit, NOW());
+        END LOOP material_loop;
+
+        CLOSE cur;
+    END IF;
+END;
+//
+
+DELIMITER ;
+
+
+-- 원자재 일지에 반영된 값을 원자재 제고 관리에 반영하는 트리거:
+DELIMITER //
+
+CREATE TRIGGER update_raw_material_inventory
+AFTER INSERT ON Materials_IncomingAndConsumptionRecords
+FOR EACH ROW
+BEGIN
+    -- 소모된 원자재 수량과 잔량 업데이트
+
+    -- RawMaterialsInventory 테이블에서 소모된 원자재 수량 및 잔량 업데이트
+    UPDATE RawMaterialsInventory
+    SET consumedAmount = consumedAmount + NEW.consumedQuantity,
+        balance = balance - NEW.consumedQuantity
+    WHERE materialID = NEW.materialRefID;
+END;
+//
+
+DELIMITER ;
